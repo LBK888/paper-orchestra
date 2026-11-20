@@ -19,11 +19,12 @@ import shutil
 from google.genai import types  # type: ignore
 
 from utils.pdf_utils import compile_latex, load_paper, pdf_to_grid_images
-from utils.gemini_utils import (
-    call_gemini_with_contents,
-    parse_gemini_json_latex_response,
-    call_gemini_with_images,
+from utils.gemini_utils import parse_gemini_json_latex_response
+from utils.llm_backend_utils import (
+    call_llm_with_contents as call_gemini_with_contents,
+    call_llm_with_images as call_gemini_with_images,
 )
+from utils.settings import get_setting
 
 from autoraters.agent_review import perform_review_agentreview
 
@@ -68,6 +69,7 @@ class ContentRefinementAgent:
         self.citation_map_path = citation_map_path
 
         self.worklogs = {}
+        self.latex_timeout = int(get_setting("pipeline.latex_timeout", 120))
         self.format_worklogs = {}
         self.current_tex = ""
         self.initial_score = 0
@@ -225,7 +227,7 @@ Respond in JSON format with the following structure:
         ) as f:
             f.write(self.current_tex)
 
-        compile_latex(self.work_dir, initial_pdf_path, "initial_draft")
+        compile_latex(self.work_dir, initial_pdf_path, "initial_draft", timeout=self.latex_timeout)
         print(f" >> Initial PDF saved to {initial_pdf_path}")
 
         if not os.path.exists(initial_pdf_path):
@@ -317,7 +319,7 @@ INSTRUCTION:
                     f.write(new_tex)
 
                 print(" >> Compiling new draft...")
-                compile_latex(self.work_dir, cur_pdf_path, cur_filename)
+                compile_latex(self.work_dir, cur_pdf_path, cur_filename, timeout=self.latex_timeout)
 
                 if not os.path.exists(cur_pdf_path):
                     print(" >> Compilation Failed. Retrying with previous version...")
@@ -543,7 +545,7 @@ block.
                 with open(candidate_tex_path, "w", encoding="utf-8") as f:
                     f.write(new_tex)
 
-                compile_latex(self.work_dir, candidate_pdf_path, candidate_tex_name)
+                compile_latex(self.work_dir, candidate_pdf_path, candidate_tex_name, timeout=self.latex_timeout)
 
                 if os.path.exists(candidate_pdf_path):
                     print(f" >> Formatting iteration {fmt_i+1} compiled successfully.")
@@ -585,7 +587,7 @@ block.
         if os.path.exists(final_valid_pdf_path):
             shutil.copy(final_valid_pdf_path, final_pdf_output_path)
         else:
-            compile_latex(self.work_dir, final_pdf_output_path, "final_refined_paper")
+            compile_latex(self.work_dir, final_pdf_output_path, "final_refined_paper", timeout=self.latex_timeout)
 
         print(
             f" >> Process Complete. Final Score: {self.current_score}, Final PDF at: {final_pdf_output_path}"

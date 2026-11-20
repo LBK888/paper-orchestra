@@ -5,3 +5,11 @@
 datasets/*
 paper_output*
 *.zip
+# local environment & user data
+.venv/
+projects/
+logs/
+config/settings.json
+.job_launch.json
+*.tmp
+.pytest_tmp/

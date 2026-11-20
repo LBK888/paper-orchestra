@@ -38,3 +38,5 @@ And then kill it:
 ```bash
 kill <PID>
 ```
+
+> **Note:** a more complete UI (projects, multi-provider settings, live status, manual revision, DOCX/MD export) now lives in `ui/app.py`. On Windows run `start.bat`; elsewhere `streamlit run ui/app.py`. This legacy demo is kept for reference.

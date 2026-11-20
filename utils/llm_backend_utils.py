@@ -12,42 +12,134 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-from typing import Optional, Callable, Dict, Any
+"""Unified LLM entry points used by every agent.
 
-from google.genai import types
+All functions accept a model spec understood by ``utils.llm_providers``:
+``gemini:...``, ``openai:...``, ``openrouter:...``, ``ollama:...``,
+``llamacpp:...``, ``vllm:...``, ``lmstudio:...``, ``custom:...`` or a bare
+legacy model name.
+"""
 
-from utils.gemini_utils import (
-    call_gemini_with_text_prompt,
-    parse_gemini_json_results,
-    call_gemini_with_contents,
-    call_gemini_with_images,
+import mimetypes
+import time
+from typing import Any, Callable, Dict, Optional
+
+import json_repair
+
+from utils.gemini_utils import call_gemini_with_contents, parse_gemini_json_results
+from utils.openai_utils import parse_openai_json_results
+from utils.llm_providers import (
+    call_ollama,
+    call_openai_compatible,
+    is_non_retryable,
+    resolve_model,
+    strip_thinking,
+    to_gemini_contents,
 )
-from utils.openai_utils import (
-    call_openai_models_with_text_prompt,
-    call_openai_models_with_content,
-    parse_openai_json_results,
-    get_openai_image_part_from_path,
-)
-from utils.pdf_utils import load_paper
 
 
 def identity_parse(response: str):
     return response
 
 
+def parse_json_results(response: str):
+    """Robust JSON extraction (fenced block, bare object/array, json_repair)."""
+    if not response or not isinstance(response, str):
+        return None
+    response = strip_thinking(response)
+    parsed = parse_openai_json_results(response)
+    if parsed is not None:
+        return parsed
+    try:
+        start = min(
+            [i for i in (response.find("{"), response.find("[")) if i != -1],
+            default=-1,
+        )
+        if start == -1:
+            return None
+        repaired = json_repair.loads(response[start:])
+        if isinstance(repaired, (dict, list)) and repaired:
+            return repaired
+    except Exception:
+        pass
+    return None
+
+
 def get_llm_parser(model_name: str, return_json: bool = True) -> Callable:
     if not return_json:
         return identity_parse
-
-    if (
-        "gpt" in model_name.lower()
-        or "o1" in model_name.lower()
-        or "o3" in model_name.lower()
-    ):
-        return parse_openai_json_results
-    else:
+    if resolve_model(model_name).type == "gemini":
         return parse_gemini_json_results
+    return parse_json_results
+
+
+def call_llm_with_contents(
+    contents: Any,
+    model_name: str,
+    generation_configs: Optional[Dict[str, Any]] = None,
+    result_parsing_func: Optional[Callable] = None,
+    check_parsed_response_not_none: bool = True,
+    return_json: bool = True,
+    max_retries: int = 5,
+    base_interval_sec: int = 5,
+) -> Dict[str, Any]:
+    """Provider-agnostic multimodal call with retry and result parsing.
+
+    Returns ``{"raw_response": str, "parsed_response": Any}`` like the legacy
+    Gemini/OpenAI helpers.
+    """
+    resolved = resolve_model(model_name)
+    parser = (
+        result_parsing_func
+        if result_parsing_func is not None
+        else get_llm_parser(model_name, return_json)
+    )
+    generation_configs = dict(generation_configs or {})
+
+    if resolved.type == "gemini":
+        return call_gemini_with_contents(
+            contents=to_gemini_contents(contents),
+            model_name=resolved.model,
+            generation_configs=generation_configs,
+            result_parsing_func=parser,
+            check_parsed_response_not_none=check_parsed_response_not_none,
+            max_retries=max_retries,
+            base_interval_sec=base_interval_sec,
+        )
+
+    if resolved.type == "ollama":
+        transport = call_ollama
+    elif resolved.type == "openai_compatible":
+        transport = call_openai_compatible
+    else:
+        raise ValueError(
+            f"Unsupported provider type '{resolved.type}' for model '{model_name}'"
+        )
+
+    raw_response = None
+    parsed_response = None
+    for attempt in range(max_retries):
+        try:
+            raw_response = transport(resolved, contents, generation_configs)
+            parsed_response = parser(raw_response)
+            if check_parsed_response_not_none:
+                assert (
+                    parsed_response is not None
+                ), f"Parsed response is None, here is the raw response:\n{raw_response}"
+            return {"raw_response": raw_response, "parsed_response": parsed_response}
+        except Exception as e:
+            print(
+                f"Warning: LLM call ({resolved.spec}) failed on attempt "
+                f"{attempt + 1}/{max_retries}. Error: {str(e)[:500]}"
+            )
+            if is_non_retryable(e) or attempt + 1 == max_retries:
+                raise
+            delay = base_interval_sec * (2 ** (attempt - 1)) if attempt > 0 else 0
+            if delay > 0:
+                print(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+
+    return {"raw_response": raw_response, "parsed_response": parsed_response}
 
 
 def call_llm_with_text_prompt(
@@ -58,48 +150,14 @@ def call_llm_with_text_prompt(
     return_json: bool = True,
     result_parsing_func: Optional[Callable] = None,
 ) -> Dict[str, Any]:
-    """
-    Unified function to call either Gemini or OpenAI models based on the model_name.
-    """
-    parser = (
-        result_parsing_func
-        if result_parsing_func is not None
-        else get_llm_parser(model_name, return_json)
+    return call_llm_with_contents(
+        contents=[prompt],
+        model_name=model_name,
+        generation_configs=generation_configs,
+        result_parsing_func=result_parsing_func,
+        check_parsed_response_not_none=check_parsed_response_not_none,
+        return_json=return_json,
     )
-
-    if generation_configs is None:
-        generation_configs = {}
-
-    if (
-        "gpt" in model_name.lower()
-        or "o1" in model_name.lower()
-        or "o3" in model_name.lower()
-    ):
-        system_prompt = None
-        configs_for_openai = dict(generation_configs) if generation_configs else {}
-        if "system_instruction" in configs_for_openai:
-            system_prompt = configs_for_openai.pop("system_instruction")
-        if "temperature" in configs_for_openai:
-            configs_for_openai.pop("temperature")
-
-        response_dict = call_openai_models_with_text_prompt(
-            prompt=prompt,
-            model_name=model_name,
-            generation_configs=configs_for_openai,
-            result_parsing_func=parser,
-            check_parsed_response_not_none=check_parsed_response_not_none,
-            system_prompt=system_prompt,
-        )
-        return response_dict
-    else:
-        response_dict = call_gemini_with_text_prompt(
-            prompt=prompt,
-            model_name=model_name,
-            generation_configs=generation_configs,
-            result_parsing_func=parser,
-            check_parsed_response_not_none=check_parsed_response_not_none,
-        )
-        return response_dict
 
 
 def call_llm_with_images(
@@ -111,54 +169,18 @@ def call_llm_with_images(
     return_json: bool = True,
     result_parsing_func: Optional[Callable] = None,
 ) -> Dict[str, Any]:
-    """
-    Unified function to call either Gemini or OpenAI models with images based on the model_name.
-    """
-    parser = (
-        result_parsing_func
-        if result_parsing_func is not None
-        else get_llm_parser(model_name, return_json)
+    contents: list = [prompt]
+    for image_path in images:
+        mime, _ = mimetypes.guess_type(image_path)
+        contents.append({"type": "image", "path": image_path, "mime_type": mime or "image/png"})
+    return call_llm_with_contents(
+        contents=contents,
+        model_name=model_name,
+        generation_configs=generation_configs,
+        result_parsing_func=result_parsing_func,
+        check_parsed_response_not_none=check_parsed_response_not_none,
+        return_json=return_json,
     )
-
-    if generation_configs is None:
-        generation_configs = {}
-
-    if (
-        "gpt" in model_name.lower()
-        or "o1" in model_name.lower()
-        or "o3" in model_name.lower()
-    ):
-        system_prompt = None
-        # Copy to avoid side-effects on caller's dictionary
-        configs_for_openai = dict(generation_configs) if generation_configs else {}
-        if "system_instruction" in configs_for_openai:
-            system_prompt = configs_for_openai.pop("system_instruction")
-        if "temperature" in configs_for_openai:
-            configs_for_openai.pop("temperature")
-
-        content = [{"type": "text", "text": prompt}]
-        for image_path in images:
-            content.extend(get_openai_image_part_from_path(image_path))
-
-        response_dict = call_openai_models_with_content(
-            content=content,
-            model_name=model_name,
-            generation_configs=configs_for_openai,
-            result_parsing_func=parser,
-            check_parsed_response_not_none=check_parsed_response_not_none,
-            system_prompt=system_prompt,
-        )
-        return response_dict
-    else:
-        response_dict = call_gemini_with_images(
-            prompt=prompt,
-            images=images,
-            model_name=model_name,
-            generation_configs=generation_configs,
-            result_parsing_func=parser,
-            check_parsed_response_not_none=check_parsed_response_not_none,
-        )
-        return response_dict
 
 
 def call_llm_with_pdf(
@@ -171,52 +193,26 @@ def call_llm_with_pdf(
     return_json: bool = True,
     result_parsing_func: Optional[Callable] = None,
 ) -> Dict[str, Any]:
-    """
-    Unified function to evaluate a PDF.
-    Passes raw PDF bytes to Gemini, and extracted text to OpenAI.
-    """
-    parser = (
-        result_parsing_func
-        if result_parsing_func is not None
-        else get_llm_parser(model_name, return_json)
-    )
-
-    if (
-        "gpt" in model_name.lower()
-        or "o1" in model_name.lower()
-        or "o3" in model_name.lower()
-    ):
-        paper_text = load_paper(pdf_path, min_size=100)
-        full_prompt = f"Paper Content:\n{paper_text}\n\nTask:\n{prompt}"
-
-        generation_configs = {}
-        response_dict = call_openai_models_with_text_prompt(
-            prompt=full_prompt,
-            model_name=model_name,
-            generation_configs=generation_configs,
-            result_parsing_func=parser,
-            check_parsed_response_not_none=check_parsed_response_not_none,
-            system_prompt=system_instruction,
-        )
-        return response_dict
-    else:
+    """Gemini receives raw PDF bytes; other providers receive extracted text."""
+    if resolve_model(model_name).type == "gemini":
         with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
+            contents = [
+                {"type": "bytes", "data": f.read(), "mime_type": "application/pdf"},
+                prompt,
+            ]
+    else:
+        from utils.pdf_utils import load_paper
 
-        contents = [
-            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-            types.Part.from_text(text=prompt),
-        ]
+        contents = [f"Paper Content:\n{load_paper(pdf_path, min_size=100)}\n\nTask:\n{prompt}"]
 
-        generation_configs = {"temperature": temperature}
-        if system_instruction is not None:
-            generation_configs["system_instruction"] = system_instruction
-
-        response_dict = call_gemini_with_contents(
-            contents=contents,
-            model_name=model_name,
-            generation_configs=generation_configs,
-            result_parsing_func=parser,
-            check_parsed_response_not_none=check_parsed_response_not_none,
-        )
-        return response_dict
+    generation_configs: Dict[str, Any] = {"temperature": temperature}
+    if system_instruction is not None:
+        generation_configs["system_instruction"] = system_instruction
+    return call_llm_with_contents(
+        contents=contents,
+        model_name=model_name,
+        generation_configs=generation_configs,
+        result_parsing_func=result_parsing_func,
+        check_parsed_response_not_none=check_parsed_response_not_none,
+        return_json=return_json,
+    )

@@ -18,6 +18,77 @@ Acting like an orchestrated team of specialized agents, it handles outline gener
 - **Visuals Generation**: Generates plots and supports the inclusion of conceptual diagrams.
 - **LaTeX Automation**: Produces submission-ready LaTeX manuscripts adhering to target conference templates.
 
+## Windows quick start（Windows 快速開始）
+
+```bat
+install.bat      :: checks Python/LaTeX/Node, creates .venv, installs everything (install.bat /y = accept all optional tools)
+start.bat        :: opens PaperOrchestra Studio at http://localhost:8501  (start.bat 8600 = other port)
+```
+
+`install.bat` 會檢查 Python（優先 3.12）、建立 `.venv` 並安裝 `requirements.txt`，並可選擇以 winget 安裝 MiKTeX（PDF 編譯）、Node.js 與 Remotion 工作區、Graphviz。
+`start.bat` 啟動 Streamlit 介面 **PaperOrchestra Studio**：
+
+| Page | What it does |
+|---|---|
+| 專案 Projects | create / open / import / export (.zip) / archive projects (`projects/<name>/`) |
+| 輸入 Inputs | idea + experimental log editors, provided figures with captions, per-project models, engines, template |
+| 執行 Run & status | run the full pipeline or a stage range, stop, live stage timeline and log tail |
+| 結果 Results | PDF pages, outline, references, figures (+ critic history, source code), reviewer scores, AI review, timing |
+| 修正 Revise | instruction-driven AI revision of the whole paper or one section (diff + history + revert), direct LaTeX editing + compile, outline editing + re-run, per-figure caption / replace / exclude / regenerate / edit-code-and-re-render |
+| 匯出 Export | PDF, Word (.docx), Markdown (+ media), LaTeX source zip, whole-project zip |
+| 設定 Settings | API keys (.env), LLM providers + model listing/ping, default models, image backends (ComfyUI / MCP / HTTP test), plotting engines, system check |
+
+## LLM providers
+
+Model names take a provider prefix; unprefixed names keep the original behaviour (`gpt*`/`o1`/`o3` → OpenAI, otherwise Gemini).
+
+| Prefix | Backend | Default endpoint |
+|---|---|---|
+| `gemini:` | Gemini API key or Vertex AI | — |
+| `openai:` | OpenAI | `https://api.openai.com/v1` |
+| `openrouter:` | OpenRouter | `https://openrouter.ai/api/v1` |
+| `ollama:` | Ollama native API (sets `num_ctx`) | `http://localhost:11434` |
+| `llamacpp:` | llama.cpp `llama-server` | `http://localhost:8080/v1` |
+| `vllm:` | vLLM OpenAI server | `http://localhost:8000/v1` |
+| `lmstudio:` | LM Studio | `http://localhost:1234/v1` |
+| `custom:` | any OpenAI-compatible endpoint | set in Settings |
+
+Examples: `ollama:qwen3:32b`, `openrouter:anthropic/claude-sonnet-4.5`, `vllm:Qwen/Qwen3-32B`. Endpoints, timeouts, vision support and per-provider concurrency live in `config/settings.json` (edited from the UI; defaults in `config/settings.default.json`). `<think>` blocks from reasoning models are stripped automatically; images are dropped with a note for providers marked as non-vision.
+
+Literature discovery (`--search_backend`): `gemini` (Google Search grounding, original), `semantic_scholar` (S2 keyword search + LLM re-ranking, works with any model), `llm` (model recall verified on S2). `auto` picks `gemini` for Gemini search models, else `semantic_scholar`.
+
+## Figures: image backends and code-based plotting
+
+Diagram images (`--image_model_name`): `gemini:<model>`, `openai:gpt-image-1` (Images API), `openrouter:<image model>`, `comfyui[:workflow.json]` (local ComfyUI, API-format workflow with `{{PROMPT}}`, `{{WIDTH}}`, … placeholders; default SDXL workflow in `config/comfyui_workflows/`), `mcp:<server>` (any MCP server tool returning an image; stdio, SSE or streamable HTTP), `http:<api>` (generic JSON API with templated body and `response_path`).
+
+Plot / diagram engines (`--plot_engine`, `--diagram_engine`): `matplotlib`, `seaborn`, `plotly` (static export via kaleido), `graphviz` (DOT), `remotion` (React/TSX composition; the last frame becomes the paper figure, optional MP4 animation), and `image` for diagrams. LLM-written code runs in a separate process with a timeout and gets up to two automatic fix attempts; the source is kept in `<project>/figures/src/` so it can be edited and re-rendered from the UI or with `po_tasks.py render-code`.
+
+## Stages and task runner
+
+The pipeline is staged and resumable: `outline → literature (+ figures in parallel) → sections → refinement`. Progress is written to `<project>/status.json`.
+
+```bash
+python paper_writing_cli.py --output_dir projects/my_paper --latex_template_dir templates/cvpr2025 \
+  --start_stage sections --writer_model_name ollama:qwen3:32b
+python po_tasks.py revise       --project projects/my_paper --instruction "Shorten the abstract" --section Abstract
+python po_tasks.py regen-figure --project projects/my_paper --figure_id fig_1 --engine seaborn --instruction "horizontal bars"
+python po_tasks.py export       --project projects/my_paper --formats pdf,docx,md,latex
+```
+
+Without LaTeX installed the pipeline still produces `final/final_paper.tex` (and DOCX/Markdown exports) but skips the review-and-refine loop and PDF compilation.
+
+## Tests
+
+The suite runs offline: `tests/mock_backend.py` stands in for every LLM provider, ComfyUI and the HTTP image API, `tests/mcp_image_server.py` is a real MCP stdio server, and Semantic Scholar is stubbed. No API keys are read or sent.
+
+```bash
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+.venv\Scripts\python -m pytest                 # everything (~1 min)
+.venv\Scripts\python -m pytest -m "not slow"   # skip the end-to-end pipeline and Remotion render (~15 s)
+```
+
+Renderer tests skip themselves when an optional tool is missing (Graphviz, Remotion, Chrome for plotly). With LaTeX installed, the end-to-end test also exercises the refine loop and PDF compilation.
+
 ## Installation
 
 1.  **Environment Setup**: The project relies on a Conda environment named `paper_orchestra`. You can set up a similar environment with Python 3.11 and install the required dependencies.

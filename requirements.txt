@@ -1,9 +1,10 @@
+# --- core pipeline ---
 google-genai
 joblib
 json_repair
 matplotlib
 numpy
-openai
+openai>=1.40
 opencv-python
 pydantic
 PyMuPDF
@@ -13,6 +14,23 @@ pypdf
 python-dotenv
 requests
 rich
-streamlit
 thefuzz
 tqdm
+Pillow
+psutil
+
+# --- code-based scientific plotting ---
+seaborn
+pandas
+plotly
+kaleido
+
+# --- image generation via MCP servers ---
+mcp>=1.9,<2
+
+# --- UI ---
+streamlit>=1.50
+
+# --- export (DOCX / Markdown) ---
+pypandoc_binary
+python-docx

@@ -16,7 +16,7 @@ import os
 import json
 import numpy as np
 
-from utils.gemini_utils import call_gemini_with_text_prompt
+from utils.llm_backend_utils import call_llm_with_text_prompt as call_gemini_with_text_prompt
 
 # --- AGENTREVIEW SPECIFIC CONSTANTS (From role_descriptions.py) ---
 

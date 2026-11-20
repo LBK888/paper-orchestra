@@ -23,9 +23,8 @@ from google.genai import types
 import pymupdf  # type: ignore
 
 from utils.pdf_utils import load_paper
-from utils.llm_backend_utils import get_llm_parser
-from utils.gemini_utils import call_gemini_with_contents
-from utils.openai_utils import call_openai_models_with_content
+from utils.llm_backend_utils import get_llm_parser, call_llm_with_contents
+from utils.llm_providers import is_gemini
 from autoraters.prompts.sxs_quality_prompts import sxs_paper_quality_system_prompt
 
 # Global lock for file writing
@@ -55,11 +54,7 @@ def rate_sxs_paper_quality(
 
     prompt_text = "Task: Compare the overall scientific contribution, technical depth, formatting, presentation, and writing quality of these two papers side by side."
 
-    is_openai = (
-        "gpt" in model_name.lower()
-        or "o1" in model_name.lower()
-        or "o3" in model_name.lower()
-    )
+    is_openai = not is_gemini(model_name)
 
     while (not succeed) and cur_try < max_retries:
         try:
@@ -97,12 +92,14 @@ def rate_sxs_paper_quality(
 
                 content.append({"type": "text", "text": prompt_text})
 
-                response_dict = call_openai_models_with_content(
-                    content=content,
+                response_dict = call_llm_with_contents(
+                    contents=content,
                     model_name=model_name,
                     result_parsing_func=get_llm_parser(model_name, return_json=True),
                     check_parsed_response_not_none=True,
-                    system_prompt=sxs_paper_quality_system_prompt,
+                    generation_configs={
+                        "system_instruction": sxs_paper_quality_system_prompt,
+                    },
                 )
             else:
                 # Setup Gemini
@@ -118,7 +115,7 @@ def rate_sxs_paper_quality(
                     types.Part.from_text(text="\n\n" + prompt_text),
                 ]
 
-                response_dict = call_gemini_with_contents(
+                response_dict = call_llm_with_contents(
                     contents=contents,
                     model_name=model_name,
                     result_parsing_func=get_llm_parser(model_name, return_json=True),

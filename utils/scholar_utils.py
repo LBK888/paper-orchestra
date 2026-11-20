@@ -15,6 +15,7 @@
 import warnings
 import os
 import requests
+import threading
 import time
 from typing import List, Dict, Union, Optional
 from thefuzz import fuzz  # type: ignore
@@ -25,7 +26,60 @@ from dotenv import load_dotenv  # type: ignore
 cur_dir = os.path.dirname(os.path.realpath(__file__))
 load_dotenv(os.path.join(cur_dir, "../.env"))
 S2_API_KEY = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
-print(f"Using S2 API Key: {S2_API_KEY}")
+print(f"Semantic Scholar API key configured: {'yes' if S2_API_KEY else 'no'}")
+
+S2_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+S2_FIELDS = "title,authors,venue,year,abstract,citationCount,journal,publicationDate"
+_s2_lock = threading.Lock()
+_s2_last_call = [0.0]
+
+
+def _s2_throttle():
+    """Serialises S2 requests to respect the public rate limit."""
+    try:
+        from utils.settings import get_setting
+
+        interval = float(get_setting("literature.s2_min_interval_sec", 1.1))
+    except Exception:
+        interval = 1.1
+    with _s2_lock:
+        wait = _s2_last_call[0] + interval - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _s2_last_call[0] = time.time()
+
+
+def _s2_get(params: Dict, timeout: float = 15, max_retries: int = 4):
+    headers = {"X-API-KEY": S2_API_KEY} if S2_API_KEY else {}
+    for attempt in range(max_retries):
+        _s2_throttle()
+        try:
+            rsp = requests.get(S2_SEARCH_URL, headers=headers, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            print(f"      ⚠️ S2 request error: {exc}")
+            time.sleep(2 * (attempt + 1))
+            continue
+        if rsp.status_code == 429:
+            time.sleep(3 * (attempt + 1))
+            continue
+        return rsp
+    return None
+
+
+def s2_keyword_search(
+    query: str, limit: int = 20, cutoff_date: Optional[str] = None
+) -> List[Dict]:
+    """Keyword search on Semantic Scholar, filtered by an optional YYYY-MM cutoff."""
+    params = {"query": query[:300], "limit": limit, "fields": S2_FIELDS}
+    if cutoff_date:
+        try:
+            params["year"] = f"-{int(cutoff_date.split('-')[0])}"
+        except ValueError:
+            pass
+    rsp = _s2_get(params)
+    if rsp is None or rsp.status_code != 200:
+        return []
+    return [r for r in rsp.json().get("data", []) or [] if r.get("title")]
 
 
 # --- SEMANTIC SCHOLAR UTILS ---
@@ -59,17 +113,8 @@ def s2_title_search(
             return True
 
     try:
-        rsp = requests.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            headers=headers,
-            params={
-                "query": title_query,
-                "limit": 3,
-                "fields": "title,authors,venue,year,abstract,citationCount,journal,publicationDate",
-            },
-            timeout=5,
-        )
-        if rsp.status_code != 200:
+        rsp = _s2_get({"query": title_query, "limit": 3, "fields": S2_FIELDS}, timeout=10)
+        if rsp is None or rsp.status_code != 200:
             return None
         results = rsp.json().get("data", [])
         if not results:

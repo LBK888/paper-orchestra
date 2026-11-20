@@ -25,8 +25,30 @@ from google.genai import types  # type: ignore
 from methods.prompts.literature_review_agent import (
     literature_review_agent_writter_prompt,
 )
-from utils.gemini_utils import call_gemini_with_contents, parse_gemini_latex_results
-from utils.scholar_utils import s2_title_search
+from utils.gemini_utils import parse_gemini_latex_results
+from utils.llm_backend_utils import call_llm_with_contents
+from utils.llm_providers import is_gemini
+from utils.scholar_utils import s2_title_search, s2_keyword_search
+from utils.settings import get_setting
+
+
+def resolve_search_backend(search_model_name: str, requested: Optional[str] = None) -> str:
+    """Picks the candidate-discovery backend.
+
+    gemini            -> Gemini + Google Search grounding (original behaviour)
+    semantic_scholar  -> S2 keyword search, LLM re-ranks (any provider, no web tool needed)
+    llm               -> LLM recalls titles from its own knowledge, verified via S2
+    """
+    backend = (requested or get_setting("literature.search_backend", "auto") or "auto").lower()
+    if backend == "auto":
+        return "gemini" if is_gemini(search_model_name) else "semantic_scholar"
+    if backend == "gemini" and not is_gemini(search_model_name):
+        print(
+            f"[LiteratureAgent] search_backend=gemini needs a Gemini search model; "
+            f"'{search_model_name}' is not one. Falling back to semantic_scholar."
+        )
+        return "semantic_scholar"
+    return backend
 
 
 class CandidatePaper(BaseModel):
@@ -71,6 +93,8 @@ class HybridLiteratureAgent:
         output_dir: str,
         model_name: str = "gemini-3.1-pro-preview",
         max_workers: int = 5,
+        search_model_name: Optional[str] = None,
+        search_backend: Optional[str] = None,
     ):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -84,7 +108,19 @@ class HybridLiteratureAgent:
             "conference_guidelines.md": conference_guidelines_path,
         }
         self.context_files = self._load_context_files()
-        self.google_search_tool = types.Tool(google_search=types.GoogleSearch())
+        self.search_model_name = search_model_name or get_setting(
+            "llm.default_models.search", "gemini-3-flash-preview"
+        )
+        self.search_backend = resolve_search_backend(self.search_model_name, search_backend)
+        self.google_search_tool = (
+            types.Tool(google_search=types.GoogleSearch())
+            if self.search_backend == "gemini"
+            else None
+        )
+        print(
+            f"[LiteratureAgent] discovery backend: {self.search_backend} "
+            f"(model: {self.search_model_name})"
+        )
 
         self.registry_lock = threading.Lock()
         self.print_lock = threading.Lock()
@@ -106,7 +142,7 @@ class HybridLiteratureAgent:
             f"🚀 Starting Fast Hybrid Literature Agent (Cutoff: {cutoff_date}, Threads: {self.max_workers})..."
         )
 
-        with open(outline_path, "r") as f:
+        with open(outline_path, "r", encoding="utf-8") as f:
             outline = json.load(f)
 
         outline_output_path = f"{self.output_dir}/outline_v1.json"
@@ -172,7 +208,9 @@ class HybridLiteratureAgent:
         if not active_tasks:
             return
 
-        self._safe_print(f"   🔎 Phase 1a: Google Candidates Discovery (MaxPool=10)...")
+        self._safe_print(
+            f"   🔎 Phase 1a: Candidate Discovery via {self.search_backend} (MaxPool=10)..."
+        )
         all_candidates_with_tasks = []
 
         with ThreadPoolExecutor(max_workers=10) as executor:  # Fast for Google Search!
@@ -461,8 +499,13 @@ class HybridLiteratureAgent:
             {DiscoveryResult.model_json_schema()}
             """
 
-        response_dict = call_gemini_with_contents(
-            model_name="gemini-3-flash-preview",
+        if self.search_backend != "gemini":
+            return self._discover_candidates_without_web_tool(
+                task, core_problem, cutoff_date, prompt
+            )
+
+        response_dict = call_llm_with_contents(
+            model_name=self.search_model_name,
             contents=[prompt],
             generation_configs={
                 "tools": [self.google_search_tool],
@@ -473,6 +516,122 @@ class HybridLiteratureAgent:
         if response_dict["parsed_response"]:
             return response_dict["parsed_response"].get("candidates", [])
         return []
+
+    def _ask_llm_for_candidates(self, prompt: str, temperature: float) -> list:
+        response_dict = call_llm_with_contents(
+            model_name=self.search_model_name,
+            contents=[prompt],
+            generation_configs={"temperature": temperature},
+        )
+        parsed = response_dict["parsed_response"]
+        return parsed.get("candidates", []) if isinstance(parsed, dict) else []
+
+    def _discover_candidates_without_web_tool(
+        self, task, core_problem, cutoff_date, knowledge_prompt
+    ) -> list:
+        """Discovery for providers without a built-in web search tool."""
+        targeted = task.get("search_type") == "targeted"
+        temperature = 0.1 if targeted else 0.3
+        knowledge_prompt = knowledge_prompt.replace(
+            "Use Google Search to find", "Using your own knowledge, identify"
+        )
+
+        if self.search_backend == "llm":
+            return self._ask_llm_for_candidates(knowledge_prompt, temperature)
+
+        # semantic_scholar: real search results, the LLM only selects among them.
+        results = s2_keyword_search(
+            task["focus"], limit=8 if targeted else 25, cutoff_date=cutoff_date
+        )
+        if not results:
+            self._safe_print(
+                f"      (S2 returned nothing for '{task['focus'][:60]}', asking the LLM instead)"
+            )
+            return self._ask_llm_for_candidates(knowledge_prompt, temperature)
+
+        listing = []
+        for idx, r in enumerate(results):
+            abstract = (r.get("abstract") or "")[:400].replace("\n", " ")
+            listing.append(
+                f"[{idx}] {r.get('title')} ({r.get('year')}, {r.get('venue') or 'n/a'}, "
+                f"citations={r.get('citationCount') or 0})\n    {abstract}"
+            )
+        listing_str = "\n".join(listing)
+        if targeted:
+            instruction = (
+                f'You are selecting the ONE academic paper described by this hint: "{task["focus"]}".\n'
+                f"CONTEXT: {task['context']}\n"
+                f"CUTOFF DATE: published before {cutoff_date}.\n\n"
+                f"Search results:\n{listing_str}\n\n"
+                "Pick the index of the paper that is exactly the one described (prefer the original paper "
+                "that introduced the dataset/model/method). If none of the results is the right paper, set "
+                '"index" to -1 and give the exact title and year of the correct paper from your own '
+                'knowledge in "title"/"year".\n\n'
+                'Return JSON only: {"index": <int>, "title": "<title if index is -1>", "year": <int>, '
+                '"reason": "<short>"}'
+            )
+        else:
+            instruction = (
+                "You are building the reference list for a research paper.\n"
+                f"SEARCH TASK: {task['focus']}\n"
+                f"CONTEXT FOR TASK: {task['context']}\n"
+                f"BROADER PROJECT PROBLEM: {core_problem}\n"
+                f"CUTOFF DATE: published before {cutoff_date}.\n\n"
+                f"Search results:\n{listing_str}\n\n"
+                "Select the 5-15 results that are strictly relevant, influential, or state-of-the-art for "
+                "this task. Do not force results; skip anything off-topic.\n"
+                'Return JSON only: {"selected": [{"index": <int>, "reason": "<why it is relevant>"}]}'
+            )
+
+        try:
+            response_dict = call_llm_with_contents(
+                model_name=self.search_model_name,
+                contents=[instruction],
+                generation_configs={"temperature": temperature},
+            )
+            parsed = response_dict["parsed_response"] or {}
+        except Exception as exc:
+            self._safe_print(f"      ⚠️ LLM re-ranking failed ({exc}); using citation order.")
+            parsed = {}
+
+        def cand_from(idx, reason):
+            r = results[idx]
+            return {"title": r["title"], "year": r.get("year") or 0, "reason": reason}
+
+        if targeted:
+            if isinstance(parsed, dict):
+                idx = parsed.get("index", -1)
+                if isinstance(idx, int) and 0 <= idx < len(results):
+                    return [cand_from(idx, parsed.get("reason", task["focus"]))]
+                if parsed.get("title"):
+                    try:
+                        year = int(parsed.get("year") or 0)
+                    except (TypeError, ValueError):
+                        year = 0
+                    return [
+                        {
+                            "title": parsed["title"],
+                            "year": year,
+                            "reason": parsed.get("reason", task["focus"]),
+                        }
+                    ]
+            return [cand_from(0, task["focus"])]
+
+        selected = parsed.get("selected", []) if isinstance(parsed, dict) else []
+        candidates = []
+        for item in selected:
+            idx = item.get("index") if isinstance(item, dict) else item
+            if isinstance(idx, int) and 0 <= idx < len(results):
+                reason = item.get("reason", "") if isinstance(item, dict) else ""
+                candidates.append(cand_from(idx, reason or task["focus"]))
+        if not candidates:
+            ranked = sorted(
+                range(len(results)),
+                key=lambda i: results[i].get("citationCount") or 0,
+                reverse=True,
+            )
+            candidates = [cand_from(i, task["focus"]) for i in ranked[:10]]
+        return candidates
 
     def _synthesize_content(self, outline, papers: List[PaperData], cutoff_date: str):
         paper_keys = [p.citation_key for p in papers]
@@ -496,7 +655,7 @@ class HybridLiteratureAgent:
         )
 
         user_prompt = "Generate the LaTeX for Introduction and Related Work sections."
-        response_dict = call_gemini_with_contents(
+        response_dict = call_llm_with_contents(
             model_name=self.model_name,
             contents=[user_prompt, json.dumps(context_payload)],
             generation_configs={"system_instruction": writer_system_prompt},
@@ -597,7 +756,7 @@ class HybridLiteratureAgent:
         loaded = {}
         for name, path in self.context_paths.items():
             if os.path.exists(path):
-                with open(path, "r") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     loaded[name] = f.read()
             else:
                 loaded[name] = ""

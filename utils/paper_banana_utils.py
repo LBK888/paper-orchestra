@@ -17,19 +17,37 @@ import io
 import re
 import os
 import json
-import matplotlib.pyplot as plt
+import tempfile
 import json_repair
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from google.genai import types
 
-from utils.gemini_utils import (
-    call_gemini_with_text_prompt,
-    call_gemini_with_contents,
-    generate_image_with_gemini,
+from utils.llm_backend_utils import (
+    call_llm_with_contents as call_gemini_with_contents,
+    call_llm_with_text_prompt as call_gemini_with_text_prompt,
 )
+from utils.image_backends import generate_image
+from utils.code_renderers import (
+    CODE_EXT,
+    CODE_LANG,
+    RenderResult,
+    code_generation_prompt,
+    engine_available,
+    extract_code,
+    fix_code_prompt,
+    render_code,
+    render_python,
+)
+from utils.settings import get_setting
 
 cur_dir = os.path.dirname(os.path.realpath(__file__))
-PB_DIR = os.path.join(cur_dir, "../../PaperBanana")
+# PaperBanana (few-shot references + style guides) is optional; point
+# PAPERBANANA_DIR or Settings > literature.paperbanana_dir at a checkout.
+PB_DIR = (
+    os.environ.get("PAPERBANANA_DIR")
+    or get_setting("literature.paperbanana_dir", "")
+    or os.path.join(cur_dir, "../../PaperBanana")
+)
 
 # ==========================================
 # PROMPTS
@@ -291,35 +309,20 @@ Provide your response strictly in the following JSON format.
 
 def execute_plot_code_worker(code_text: str) -> str:
     """
-    Independent plot code execution worker:
+    Plot code execution worker (runs in a separate Python process):
     1. Extract code
-    2. Execute plotting
-    3. Return JPEG as Base64 string
+    2. Execute plotting with a timeout
+    3. Return PNG as Base64 string (None on failure)
     """
-    match = re.search(r"```python(.*?)```", code_text, re.DOTALL)
-    code_clean = match.group(1).strip() if match else code_text.strip()
-
-    plt.switch_backend("Agg")
-    plt.close("all")
-    plt.rcdefaults()
-
-    try:
-        exec_globals = {}
-        exec(code_clean, exec_globals)
-        if plt.get_fignums():
-            buf = io.BytesIO()
-            plt.savefig(buf, format="jpeg", bbox_inches="tight", dpi=300)
-            plt.close("all")
-
-            buf.seek(0)
-            img_bytes = buf.read()
-            return base64.b64encode(img_bytes).decode("utf-8")
-        else:
+    code_clean = extract_code(code_text, ["python", "py"])
+    with tempfile.TemporaryDirectory(prefix="po_plot_") as tmp:
+        out = os.path.join(tmp, "plot.png")
+        result = render_python(code_clean, out, work_dir=tmp)
+        if not result.ok:
+            print(f"Error executing plot code: {result.error}")
             return None
-
-    except Exception as e:
-        print(f"Error executing plot code: {e}")
-        return None
+        with open(out, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
 
 
 def identity_parse(response: str):
@@ -436,7 +439,7 @@ def generate_figure_caption(
         contents = [
             types.Part.from_text(text=prompt),
             types.Part.from_bytes(
-                data=base64.b64decode(base64_image), mime_type="image/jpeg"
+                data=base64.b64decode(base64_image), mime_type="image/png"
             ),
         ]
         response_dict = call_gemini_with_contents(
@@ -602,7 +605,7 @@ def critique_and_revise_figure(
     if base64_image and len(base64_image) > 100:
         contents.append(
             types.Part.from_bytes(
-                data=base64.b64decode(base64_image), mime_type="image/jpeg"
+                data=base64.b64decode(base64_image), mime_type="image/png"
             )
         )
     else:
@@ -643,39 +646,126 @@ def critique_and_revise_figure(
     return revised_description, critic_suggestions
 
 
+def resolve_engine(task_name: str, engine: Optional[str] = None) -> str:
+    """Chooses the rendering engine for a figure, falling back if unavailable."""
+    if task_name == "plot":
+        engine = engine or get_setting("plotting.plot_engine", "matplotlib")
+        fallback = "matplotlib"
+    else:
+        engine = engine or get_setting("plotting.diagram_engine", "image")
+        fallback = "image"
+    if engine == "image" and task_name == "plot":
+        engine = "matplotlib"
+    if not engine_available(engine):
+        print(f"[plotting] engine '{engine}' is not available here; falling back to '{fallback}'.")
+        engine = fallback
+    return engine
+
+
+def generate_figure_with_engine(
+    task_name: str,
+    figure_description: str,
+    model_name: str = "gemini-3.1-pro-preview",
+    image_model_name: str = "gemini-3-pro-image-preview",
+    aspect_ratio: str = "16:9",
+    engine: Optional[str] = None,
+    work_dir: Optional[str] = None,
+    figure_id: str = "figure",
+    max_fix_attempts: int = 2,
+) -> Dict[str, Any]:
+    """Generates a figure and returns ``{"base64_img", "engine", "code", "code_path",
+    "error", "animation_path"}``. Code-based engines get up to ``max_fix_attempts``
+    self-repair rounds when the generated code fails to render."""
+    engine = resolve_engine(task_name, engine)
+    out: Dict[str, Any] = {
+        "engine": engine,
+        "base64_img": None,
+        "code": "",
+        "code_path": None,
+        "error": "",
+        "animation_path": None,
+    }
+
+    if engine == "image":
+        prompt_text = (
+            "Render an image based on the following detailed description: "
+            f"{figure_description}\n Note that do not include figure titles in the image. Diagram: "
+        )
+        out["base64_img"] = generate_image(
+            prompt=prompt_text,
+            backend=image_model_name,
+            aspect_ratio=aspect_ratio,
+            system_instruction=DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT,
+        )
+        if not out["base64_img"]:
+            out["error"] = f"Image backend '{image_model_name}' returned no image."
+        return out
+
+    system_prompt = (
+        PLOT_VISUALIZER_AGENT_SYSTEM_PROMPT
+        if task_name == "plot"
+        else "You are an expert scientific illustrator who draws diagrams with code."
+    )
+    lang = CODE_LANG[engine]
+    work_dir = work_dir or tempfile.mkdtemp(prefix="po_fig_")
+    os.makedirs(work_dir, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", figure_id).lower() or "figure"
+    image_path = os.path.join(work_dir, f"{safe_id}.png")
+
+    response_dict = call_gemini_with_contents(
+        contents=[
+            types.Part.from_text(text=system_prompt),
+            types.Part.from_text(
+                text=code_generation_prompt(engine, task_name, figure_description, aspect_ratio)
+            ),
+        ],
+        model_name=model_name,
+        result_parsing_func=identity_parse,
+    )
+    code = extract_code(response_dict["parsed_response"], [lang, "python", "typescript", "jsx"])
+
+    result = RenderResult(False, code=code, error="not rendered")
+    for attempt in range(max_fix_attempts + 1):
+        result = render_code(engine, code, image_path, name=safe_id, aspect_ratio=aspect_ratio)
+        if result.ok:
+            break
+        print(f"[plotting] {figure_id}: {engine} render failed (attempt {attempt + 1}): {result.error[-300:]}")
+        if attempt == max_fix_attempts:
+            break
+        fix = call_gemini_with_contents(
+            contents=[types.Part.from_text(text=fix_code_prompt(engine, code, result.error))],
+            model_name=model_name,
+            result_parsing_func=identity_parse,
+        )
+        code = extract_code(fix["parsed_response"], [lang, "python", "typescript", "jsx"])
+
+    code_path = os.path.join(work_dir, f"{safe_id}{CODE_EXT[lang]}")
+    with open(code_path, "w", encoding="utf-8") as f:
+        f.write(code)
+    out.update({"code": code, "code_path": code_path, "error": "" if result.ok else result.error})
+    if result.ok and result.image_path:
+        with open(result.image_path, "rb") as f:
+            out["base64_img"] = base64.b64encode(f.read()).decode("utf-8")
+        out["animation_path"] = result.animation_path
+    return out
+
+
 def generate_figure_visuals(
     task_name: str,
     figure_description: str,
     model_name: str = "gemini-3.1-pro-preview",
     image_model_name: str = "gemini-3-pro-image-preview",
     aspect_ratio: str = "16:9",
+    engine: Optional[str] = None,
 ) -> str:
     """
-    Generates the figure based on the task type.
+    Generates the figure based on the task type. Returns base64 PNG or None.
     """
-    if task_name == "plot":
-        prompt_text = f"Use python matplotlib to generate a statistical plot based on the following detailed description: {figure_description}\n Only provide the code without any explanations. Code:"
-        contents = [
-            types.Part.from_text(text=PLOT_VISUALIZER_AGENT_SYSTEM_PROMPT),
-            types.Part.from_text(text=prompt_text),
-        ]
-        response_dict = call_gemini_with_contents(
-            contents=contents,
-            model_name=model_name,
-            result_parsing_func=identity_parse,
-        )
-        code_text = response_dict["parsed_response"]
-        base64_img = execute_plot_code_worker(code_text)
-        return base64_img
-    else:
-        # Prompt for diagram image generation
-        prompt_text = f"Render an image based on the following detailed description: {figure_description}\n Note that do not include figure titles in the image. Diagram: "
-
-        return generate_image_with_gemini(
-            model_name=image_model_name,
-            prompt=prompt_text,
-            aspect_ratio=aspect_ratio,
-            generation_configs={
-                "system_instruction": DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT
-            },
-        )
+    return generate_figure_with_engine(
+        task_name=task_name,
+        figure_description=figure_description,
+        model_name=model_name,
+        image_model_name=image_model_name,
+        aspect_ratio=aspect_ratio,
+        engine=engine,
+    )["base64_img"]

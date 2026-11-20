@@ -87,7 +87,7 @@ def parse_sections(json_data, output_folder=""):
         else:
             section_results[-1]["content"] += content
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(section_results, f, indent=4)
         print(f"Dumped paper sections to {output_path}.")
 
@@ -166,7 +166,12 @@ def get_paper_references_from_pdf(
     return None
 
 
-def compile_latex(cwd, pdf_file, texfile_name="template", timeout=30):
+def latex_available() -> bool:
+    """True when pdflatex and bibtex are on PATH (MiKTeX / TeX Live)."""
+    return shutil.which("pdflatex") is not None and shutil.which("bibtex") is not None
+
+
+def compile_latex(cwd, pdf_file, texfile_name="template", timeout=120):
     import os, shutil, subprocess, traceback, rich
 
     source_pdf = os.path.join(cwd, f"{texfile_name}.pdf")
